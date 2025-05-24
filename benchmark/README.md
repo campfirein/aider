@@ -83,6 +83,47 @@ You can run `./benchmark/benchmark.py --help` for a list of all the arguments, b
 - `--num-tests` specifies how many of the tests to run before stopping. This is another way to start gently as you debug your benchmarking setup.
 - `--keywords` filters the tests to run to only the ones whose name match the supplied argument (similar to `pytest -k xxxx`).
 - `--read-model-settings=<filename.yml>` specify model settings, see here: https://aider.chat/docs/config/adv-model-settings.html#model-settings
+- `--memory-create` and `--memory-retrieve`: Enable ByteRover memory system features during benchmarking (requires `--byterover-api-key` and `--byterover-user-id`)
+
+### Memory retrieval testing
+
+The benchmark includes a dedicated memory testing command that allows you to test the ByteRover memory retrieval system without running full benchmarks. This is useful for:
+
+- Analyzing what memories are retrieved for different exercises
+- Testing memory system performance and API connectivity  
+- Debugging memory relevance for different programming languages
+- Building datasets for memory system improvements
+
+```bash
+# Test memory retrieval for all Python exercises
+./benchmark/benchmark.py test-memory --languages python --byterover-api-key YOUR_API_KEY --byterover-user-id YOUR_USER_ID
+
+# Test 10% of all exercises with detailed output
+./benchmark/benchmark.py test-memory --percentage 10 --verbose --output-csv sample_test.csv
+
+# Test specific exercises containing "algorithm" keyword
+./benchmark/benchmark.py test-memory --keywords algorithm --memory-limit 5
+
+# Append results to existing CSV file
+./benchmark/benchmark.py test-memory --languages javascript --append --output-csv ongoing_test.csv
+```
+
+The command outputs results to a CSV file with columns including:
+- `exercise_name`, `language`, `instruction_preview` - Exercise details
+- `search_query` - The exact query used for memory search
+- `num_memories_found` - Number of memories retrieved
+- `memory_1_content`, `memory_1_score`, `memory_1_id` - Details of retrieved memories
+- `api_error` - Any error messages from the ByteRover API
+
+Key options:
+- `--byterover-api-key` and `--byterover-user-id`: ByteRover credentials (can use environment variables `BYTEROVER_API_KEY` and `BYTEROVER_USER_ID`)
+- `--languages`: Filter to specific programming languages (comma-separated)
+- `--keywords`: Filter exercises containing specific keywords
+- `--percentage`: Percentage of exercises to test (default: 100%)
+- `--memory-limit`: Maximum memories to retrieve per exercise (default: 3)
+- `--output-csv`: Output CSV file path (default: memory_test_results.csv)
+- `--append`: Append to existing CSV instead of overwriting
+- `--verbose`: Show detailed progress and memory retrieval information
 
 ### Benchmark report
 

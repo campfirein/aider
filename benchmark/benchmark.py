@@ -1181,5 +1181,362 @@ def cleanup_test_output(output, testdir):
     return res
 
 
+@app.command()
+def test_memory(
+    # Exercise selection
+    exercises_dir: str = typer.Option(EXERCISES_DIR_DEFAULT, "--exercises-dir", help="Directory with exercise files"),
+    languages: str = typer.Option(None, "--languages", "-l", help="Only test specific languages (comma separated)"),
+    keywords: str = typer.Option(None, "--keywords", "-k", help="Only test exercises containing keywords (comma sep)"),
+    
+    # Test selection 
+    num_tests: int = typer.Option(-1, "--num-tests", help="Number of exercises to test"),
+    percentage: float = typer.Option(100.0, "--percentage", "-p", help="Percentage of exercises to test (1-100)", min=1.0, max=100.0),
+    seed: Optional[int] = typer.Option(None, "--seed", help="Random seed for reproducible selection"),
+    
+    # Memory system
+    byterover_api_key: str = typer.Option(None, "--byterover-api-key", help="ByteRover API key", envvar="BYTEROVER_API_KEY"),
+    byterover_user_id: str = typer.Option(None, "--byterover-user-id", help="ByteRover User ID", envvar="BYTEROVER_USER_ID"),
+    memory_limit: int = typer.Option(3, "--memory-limit", help="Maximum number of memories to retrieve"),
+    
+    # Output options
+    output_csv: str = typer.Option("memory_test_results.csv", "--output-csv", "-o", help="Path to output CSV file"),
+    append_mode: bool = typer.Option(False, "--append", help="Append to existing CSV instead of overwriting"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+):
+    """Test memory retrieval for exercises and output results to CSV"""
+    
+    # Validate ByteRover credentials
+    if not byterover_api_key or not byterover_user_id:
+        print("Error: ByteRover API key and User ID are required for memory testing")
+        print("Use --byterover-api-key and --byterover-user-id or set BYTEROVER_API_KEY and BYTEROVER_USER_ID environment variables")
+        return 1
+    
+    # Initialize ByteRover service
+    byterover_service = ByteroverService(byterover_api_key, byterover_user_id)
+    if not byterover_service.is_service_configured():
+        print("Error: Failed to configure ByteRover service")
+        return 1
+    
+    print(f"ByteRover memory testing initialized (limit: {memory_limit})")
+    
+    # Run the memory retrieval test
+    try:
+        results = test_memory_retrieval(
+            exercises_dir=exercises_dir,
+            languages=languages,
+            keywords=keywords,
+            num_tests=num_tests,
+            percentage=percentage,
+            seed=seed,
+            memory_limit=memory_limit,
+            byterover_service=byterover_service,
+            verbose=verbose,
+        )
+        
+        # Write results to CSV
+        write_results_to_csv(results, output_csv, append_mode)
+        
+        # Print summary statistics
+        print_memory_test_summary(results)
+        
+        return 0
+        
+    except Exception as e:
+        print(f"Error during memory testing: {e}")
+        traceback.print_exc()
+        return 1
+
+
+def test_memory_retrieval(
+    exercises_dir: str,
+    languages: Optional[str] = None,
+    keywords: Optional[str] = None,
+    num_tests: int = -1,
+    percentage: float = 100.0,
+    seed: Optional[int] = None,
+    memory_limit: int = 3,
+    byterover_service: ByteroverService = None,
+    verbose: bool = False,
+) -> List[dict]:
+    """Test memory retrieval for selected exercises and return results"""
+    
+    original_dname = BENCHMARK_DNAME / exercises_dir
+    if not original_dname.exists():
+        raise ValueError(f"Exercises directory not found: {original_dname}")
+    
+    # Get exercise directories using existing logic
+    def get_exercise_dirs(base_dir, languages=None):
+        """Get all exercise directories for specified languages (or all if none specified)"""
+        base_dir = Path(base_dir)
+
+        # Get available language dirs
+        lang_dirs = [d for d in base_dir.iterdir() if d.is_dir()]
+
+        # Filter to requested languages if specified
+        if languages:
+            requested = set(lang.strip().lower() for lang in languages.split(","))
+            lang_dirs = [d for d in lang_dirs if d.name.lower() in requested]
+            if not lang_dirs:
+                print(f"No matching language directories found for: {languages}")
+                return []
+
+        # Get all exercise dirs under exercises/practice for each language
+        exercise_dirs = []
+        for lang_dir in lang_dirs:
+            practice_dir = lang_dir / "exercises" / "practice"
+            if practice_dir.exists():
+                exercise_dirs.extend(d for d in practice_dir.iterdir() if d.is_dir())
+
+        return exercise_dirs
+    
+    exercise_dirs = get_exercise_dirs(original_dname, languages)
+    
+    if not exercise_dirs:
+        print("No exercise directories found")
+        return []
+    
+    # Apply keyword filtering
+    test_dnames = sorted(str(d.relative_to(original_dname)) for d in exercise_dirs)
+    
+    if keywords:
+        keywords_list = keywords.split(",")
+        test_dnames = [dn for dn in test_dnames for keyword in keywords_list if keyword in dn]
+    
+    total_tests = len(test_dnames)
+    
+    # Set random seed if provided for reproducible test selection
+    if seed is not None:
+        random.seed(seed)
+        
+    random.shuffle(test_dnames)
+    
+    # Handle test selection
+    if num_tests > 0:
+        # If num_tests is explicitly set, it takes precedence
+        test_dnames = test_dnames[:num_tests]
+        print(f"Testing {len(test_dnames)} of {total_tests} exercises (using --num-tests)")
+    else:
+        # Otherwise use percentage
+        num_to_run = max(1, int(total_tests * percentage / 100.0))
+        test_dnames = test_dnames[:num_to_run]
+        print(f"Testing {num_to_run} of {total_tests} exercises ({percentage:.1f}%)")
+    
+    # Process each exercise
+    results = []
+    console = Console(highlight=False) if verbose else None
+    
+    for i, test_path in enumerate(test_dnames):
+        if verbose and console:
+            console.print(f"[{i + 1}/{len(test_dnames)}] Processing {test_path}")
+        
+        try:
+            testdir = original_dname / test_path
+            result = test_single_exercise_memory(testdir, test_path, memory_limit, byterover_service, verbose)
+            results.append(result)
+            
+        except Exception as e:
+            if verbose:
+                print(f"Error processing {test_path}: {e}")
+            # Still record the error in results
+            results.append({
+                'timestamp': datetime.datetime.now().isoformat(),
+                'exercise_name': Path(test_path).name,
+                'language': test_path.split('/')[0] if '/' in test_path else 'unknown',
+                'exercise_path': test_path,
+                'instruction_preview': '',
+                'full_instruction_length': 0,
+                'search_query': '',
+                'num_memories_found': 0,
+                'api_error': str(e),
+                **{f'memory_{j + 1}_content': '' for j in range(memory_limit)},
+                **{f'memory_{j + 1}_score': 0.0 for j in range(memory_limit)},
+                **{f'memory_{j + 1}_id': '' for j in range(memory_limit)},
+            })
+    
+    return results
+
+
+def test_single_exercise_memory(testdir: Path, test_path: str, memory_limit: int, byterover_service: ByteroverService, verbose: bool = False) -> dict:
+    """Test memory retrieval for a single exercise"""
+    
+    # Load exercise instructions using same logic as run_test_real
+    instructions = load_exercise_instructions(testdir)
+    
+    # Create search query using same logic as main benchmark
+    search_query = create_search_query(testdir.name, instructions)
+    
+    # Initialize result structure
+    result = {
+        'timestamp': datetime.datetime.now().isoformat(),
+        'exercise_name': testdir.name,
+        'language': test_path.split('/')[0] if '/' in test_path else 'unknown',
+        'exercise_path': test_path,
+        'instruction_preview': instructions[:200] if instructions else '',
+        'full_instruction_length': len(instructions),
+        'search_query': search_query,
+        'num_memories_found': 0,
+        'api_error': '',
+    }
+    
+    # Initialize memory fields
+    for j in range(memory_limit):
+        result[f'memory_{j + 1}_content'] = ''
+        result[f'memory_{j + 1}_score'] = 0.0
+        result[f'memory_{j + 1}_id'] = ''
+    
+    # Retrieve memories
+    try:
+        memory_results = byterover_service.search_memories(search_query, memory_limit)
+        
+        if memory_results and memory_results.get("results"):
+            memories = memory_results["results"]
+            result['num_memories_found'] = len(memories)
+            
+            # Store individual memory details
+            for j, memory in enumerate(memories[:memory_limit]):
+                result[f'memory_{j + 1}_content'] = memory.get('memory', '')[:500]  # Truncate for CSV
+                result[f'memory_{j + 1}_score'] = memory.get('score', 0.0)
+                result[f'memory_{j + 1}_id'] = memory.get('id', '')
+            
+            if verbose:
+                print(f"  Found {len(memories)} memories for {testdir.name}")
+        else:
+            if verbose:
+                print(f"  No memories found for {testdir.name}")
+                
+    except Exception as e:
+        result['api_error'] = str(e)
+        if verbose:
+            print(f"  API error for {testdir.name}: {e}")
+    
+    return result
+
+
+def load_exercise_instructions(testdir: Path) -> str:
+    """Load exercise instructions from .docs files"""
+    instructions = ""
+    
+    try:
+        introduction = testdir / ".docs/introduction.md"
+        if introduction.exists():
+            instructions += introduction.read_text()
+        
+        instructions_file = testdir / ".docs/instructions.md"
+        if instructions_file.exists():
+            instructions += instructions_file.read_text()
+        
+        instructions_append = testdir / ".docs/instructions.append.md"
+        if instructions_append.exists():
+            instructions += instructions_append.read_text()
+            
+    except Exception as e:
+        print(f"Warning: Error loading instructions for {testdir}: {e}")
+    
+    return instructions
+
+
+def create_search_query(exercise_name: str, instructions: str) -> str:
+    """Create search query using same logic as main benchmark"""
+    return f"Exercise: {exercise_name} {instructions[:200]}"
+
+
+def write_results_to_csv(results: List[dict], output_path: str, append_mode: bool = False):
+    """Write memory test results to CSV file"""
+    if not results:
+        print("No results to write")
+        return
+    
+    import csv
+    
+    # Define field order for CSV
+    base_fields = [
+        'timestamp', 'exercise_name', 'language', 'exercise_path', 
+        'instruction_preview', 'full_instruction_length', 'search_query',
+        'num_memories_found', 'api_error'
+    ]
+    
+    # Add memory fields based on the first result
+    memory_limit = 0
+    for key in results[0].keys():
+        if key.startswith('memory_') and key.endswith('_content'):
+            memory_limit += 1
+    
+    memory_fields = []
+    for j in range(memory_limit):
+        memory_fields.extend([
+            f'memory_{j + 1}_content',
+            f'memory_{j + 1}_score', 
+            f'memory_{j + 1}_id'
+        ])
+    
+    fieldnames = base_fields + memory_fields
+    
+    # Determine write mode
+    file_exists = Path(output_path).exists()
+    write_mode = 'a' if (append_mode and file_exists) else 'w'
+    write_header = not (append_mode and file_exists)
+    
+    try:
+        with open(output_path, write_mode, newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            if write_header:
+                writer.writeheader()
+            
+            for result in results:
+                # Ensure all fields are present
+                row = {field: result.get(field, '') for field in fieldnames}
+                writer.writerow(row)
+        
+        print(f"Results written to {output_path} ({len(results)} rows)")
+        
+    except Exception as e:
+        print(f"Error writing CSV file: {e}")
+        raise
+
+
+def print_memory_test_summary(results: List[dict]):
+    """Print summary statistics for memory test results"""
+    if not results:
+        return
+    
+    total_exercises = len(results)
+    exercises_with_memories = sum(1 for r in results if r['num_memories_found'] > 0)
+    exercises_with_errors = sum(1 for r in results if r['api_error'])
+    total_memories = sum(r['num_memories_found'] for r in results)
+    
+    print("\n" + "="*50)
+    print("MEMORY RETRIEVAL TEST SUMMARY")
+    print("="*50)
+    print(f"Total exercises tested: {total_exercises}")
+    print(f"Exercises with memories found: {exercises_with_memories} ({exercises_with_memories / total_exercises * 100:.1f}%)")
+    print(f"Exercises with no memories: {total_exercises - exercises_with_memories} ({(total_exercises - exercises_with_memories) / total_exercises * 100:.1f}%)")
+    print(f"Exercises with API errors: {exercises_with_errors} ({exercises_with_errors / total_exercises * 100:.1f}%)")
+    print(f"Total memories retrieved: {total_memories}")
+    print(f"Average memories per exercise: {total_memories / total_exercises:.2f}")
+    
+    if exercises_with_memories > 0:
+        avg_memories_when_found = sum(r['num_memories_found'] for r in results if r['num_memories_found'] > 0) / exercises_with_memories
+        print(f"Average memories when found: {avg_memories_when_found:.2f}")
+    
+    # Language breakdown
+    language_stats = {}
+    for result in results:
+        lang = result['language']
+        if lang not in language_stats:
+            language_stats[lang] = {'total': 0, 'with_memories': 0}
+        language_stats[lang]['total'] += 1
+        if result['num_memories_found'] > 0:
+            language_stats[lang]['with_memories'] += 1
+    
+    if len(language_stats) > 1:
+        print(f"\nLanguage breakdown:")
+        for lang, stats in sorted(language_stats.items()):
+            pct = stats['with_memories'] / stats['total'] * 100 if stats['total'] > 0 else 0
+            print(f"  {lang}: {stats['with_memories']}/{stats['total']} ({pct:.1f}%)")
+    
+    print("="*50)
+
+
 if __name__ == "__main__":
     app()
