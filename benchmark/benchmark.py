@@ -25,12 +25,15 @@ from dotenv import load_dotenv
 from plots import plot_refactoring
 from rich.console import Console
 
+# Import ByteRover service
+from byterover_service import ByteroverService
+
 from aider import models, sendchat
 from aider.coders import Coder, base_coder
 from aider.dump import dump  # noqa: F401
 from aider.io import InputOutput
 
-BENCHMARK_DNAME = Path(os.environ.get("AIDER_BENCHMARK_DIR", "tmp.benchmarks"))
+BENCHMARK_DNAME = Path(os.environ.get("AIDER_BENCHMARK_DIR", "byterover.benchmarks"))
 
 EXERCISES_DIR_DEFAULT = "polyglot-benchmark"
 
@@ -43,7 +46,7 @@ load_dotenv(override=True)
 def find_latest_benchmark_dir():
     benchmark_dirs = [d for d in BENCHMARK_DNAME.iterdir() if d.is_dir()]
     if not benchmark_dirs:
-        print("Error: No benchmark directories found under tmp.benchmarks.")
+        print("Error: No benchmark directories found under byterover.benchmarks.")
         sys.exit(1)
 
     # Get current time and 24 hours ago
@@ -199,7 +202,20 @@ def main(
     diffs_only: bool = typer.Option(False, "--diffs", help="Just diff the provided stats dirs"),
     tries: int = typer.Option(2, "--tries", "-r", help="Number of tries for running tests"),
     threads: int = typer.Option(1, "--threads", "-t", help="Number of threads to run in parallel"),
-    num_tests: int = typer.Option(-1, "--num-tests", "-n", help="Number of tests to run"),
+    num_tests: int = typer.Option(-1, "--num-tests", help="Number of tests to run"),
+    percentage: float = typer.Option(
+        5.0,
+        "--percentage",
+        "-p",
+        help="Percentage of benchmark tests to run (1-100), defaults to 5%. Use 100 for all tests.",
+        min=1.0,
+        max=100.0
+    ),
+    seed: Optional[int] = typer.Option(
+        None,
+        "--seed",
+        help="Random seed for test selection when using percentage"
+    ),
     num_ctx: Optional[int] = typer.Option(
         None, "--num-ctx", help="Override model context window size"
     ),
@@ -215,7 +231,34 @@ def main(
     exercises_dir: str = typer.Option(
         EXERCISES_DIR_DEFAULT, "--exercises-dir", help="Directory with exercise files"
     ),
+    # ByteRover memory system options
+    memory_create: bool = typer.Option(
+        False, "--memory-create", help="Enable creation of memories from benchmark runs"
+    ),
+    memory_retrieve: bool = typer.Option(
+        False, "--memory-retrieve", help="Enable retrieval of relevant memories for tasks"
+    ),
+    byterover_api_key: str = typer.Option(
+        None, "--byterover-api-key", help="ByteRover API key", envvar="BYTEROVER_API_KEY"
+    ),
+    byterover_user_id: str = typer.Option(
+        None, "--byterover-user-id", help="ByteRover User ID", envvar="BYTEROVER_USER_ID"
+    ),
+    memory_limit: int = typer.Option(
+        3, "--memory-limit", help="Maximum number of memories to retrieve"
+    ),
 ):
+    # Initialize ByteRover service if memory features are enabled
+    byterover_service = None
+    memory_features_requested = memory_create or memory_retrieve
+    if memory_features_requested:
+        if not byterover_api_key or not byterover_user_id:
+            print("Error: ByteRover API key and User ID are required when using memory features (--memory-create or --memory-retrieve)")
+            return 1
+        
+        byterover_service = ByteroverService(byterover_api_key, byterover_user_id)
+        print(f"ByteRover memory system initialized (create: {memory_create}, retrieve: {memory_retrieve})")
+
     repo = git.Repo(search_parent_directories=True)
     commit_hash = repo.head.object.hexsha[:7]
     if repo.is_dirty():
@@ -340,9 +383,28 @@ def main(
         keywords = keywords.split(",")
         test_dnames = [dn for dn in test_dnames for keyword in keywords if keyword in dn]
 
+    total_tests = len(test_dnames)
+    
+    # Set random seed if provided for reproducible test selection
+    if seed is not None:
+        random.seed(seed)
+        
     random.shuffle(test_dnames)
+    
+    # Handle percentage-based test selection
     if num_tests > 0:
+        # If num_tests is explicitly set, it takes precedence
         test_dnames = test_dnames[:num_tests]
+        print(f"Running {len(test_dnames)} of {total_tests} tests (using --num-tests)")
+    else:
+        # Otherwise use percentage (default is now 5%)
+        num_to_run = max(1, int(total_tests * percentage / 100.0))
+        test_dnames = test_dnames[:num_to_run]
+        print(f"Running {num_to_run} of {total_tests} tests ({percentage:.1f}%)")
+        
+        # If running 100%, make it clear
+        if percentage == 100.0:
+            print("Running ALL tests (100%)")
 
     # Don't give up when benchmarking
     LONG_TIMEOUT = 24 * 60 * 60
@@ -370,6 +432,10 @@ def main(
                 sleep,
                 reasoning_effort,
                 thinking_tokens,
+                byterover_service=byterover_service,
+                memory_create=memory_create,
+                memory_retrieve=memory_retrieve,
+                memory_limit=memory_limit,
             )
 
             all_results.append(results)
@@ -396,6 +462,10 @@ def main(
                 sleep,
                 reasoning_effort,
                 thinking_tokens,
+                byterover_service=byterover_service,
+                memory_create=memory_create,
+                memory_retrieve=memory_retrieve,
+                memory_limit=memory_limit,
             )
         all_results = run_test_threaded.gather(tqdm=True)
 
@@ -694,6 +764,10 @@ def run_test_real(
     reasoning_effort: Optional[str] = None,
     thinking_tokens: Optional[int] = None,
     read_model_settings=None,
+    byterover_service=None,
+    memory_create=False,
+    memory_retrieve=False,
+    memory_limit=3,
 ):
     if not os.path.isdir(testdir):
         print("Not a dir:", testdir)
@@ -782,6 +856,27 @@ def run_test_real(
         instructions += instructions_append.read_text()
 
     instructions += prompts.instructions_addendum.format(file_list=file_list)
+    
+    # Retrieve relevant memories if enabled
+    memory_results = {"results": []}
+    if memory_retrieve and byterover_service:
+        try:
+            # Create a search query based on the exercise
+            search_query = f"Exercise: {testdir.name} {instructions[:200]}"
+            
+            # Retrieve relevant memories
+            memory_results = byterover_service.search_memories(search_query, memory_limit)
+            if memory_results and memory_results.get("results"):
+                # Format memories to append to instructions
+                memory_content = "\n\nRelevant past experiences:\n"
+                for idx, result in enumerate(memory_results["results"]):
+                    memory_content += f"\n{idx + 1}. {result['memory']}\n"
+                
+                # Append memories to instructions
+                instructions += memory_content
+                print(f"Added {len(memory_results['results'])} memories to instructions for {testdir.name}")
+        except Exception as e:
+            print(f"Error retrieving memories: {e}")
 
     io = InputOutput(
         pretty=False,
@@ -939,6 +1034,29 @@ def run_test_real(
             if verbose:
                 print(f"Failed to clean up Node.js node_modules directory: {e}")
 
+    # Create memory from the exercise and outcome if enabled
+    if memory_create and byterover_service and not no_aider:
+        try:
+            # Create memory from the exercise and outcome
+            outcome_str = "successful" if True in test_outcomes else "unsuccessful"
+            memory_messages = [
+                {"role": "user", "content": instructions[:1000]},  # Truncate if too long
+                {"role": "assistant", "content": response[:1000] if 'response' in locals() else "No response generated"}  # Truncate if too long
+            ]
+            
+            # Add test outcome information
+            summary = f"Exercise '{testdir.name}' was {outcome_str}. "
+            if True in test_outcomes:
+                summary += f"Passed on attempt {test_outcomes.index(True) + 1} of {tries}."
+            else:
+                summary += f"Failed after {tries} attempts."
+            
+            # Create the memory
+            byterover_service.create_memory(memory_messages)
+            print(f"Created memory for {testdir.name}")
+        except Exception as e:
+            print(f"Error creating memory: {e}")
+
     results = dict(
         testdir=str(testdir),
         testcase=testdir.name,
@@ -967,6 +1085,14 @@ def run_test_real(
             )
         ),
     )
+    
+    # Add memory-related metrics to results
+    if byterover_service:
+        results.update({
+            "memory_create_enabled": memory_create,
+            "memory_retrieve_enabled": memory_retrieve,
+            "memories_used": len(memory_results.get("results", [])) if memory_retrieve else 0,
+        })
 
     if edit_format == "architect":
         results["editor_model"] = main_model.editor_model.name if main_model.editor_model else None

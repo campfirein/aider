@@ -16,3 +16,8 @@ aider/_version.py
 .#*
 .gitattributes
 tmp.benchmarks/
+.bash_history
+.cline
+.windsurf
+.cursor
+byterover.benchmarks
